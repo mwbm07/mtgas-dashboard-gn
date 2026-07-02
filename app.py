@@ -6,10 +6,11 @@ import base64
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from PIL import Image
 
 # =========================================================
 # DASHBOARD MTGÁS - VENDAS DE GÁS NATURAL (GN)
-# Versão adaptada para Streamlit Community Cloud
+# Arquivo completo para substituir o app.py existente
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
