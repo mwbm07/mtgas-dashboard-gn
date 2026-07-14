@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
 import base64
+import io
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from PIL import Image
 
 # =========================================================
 # DASHBOARD MTGÁS - VENDAS DE GÁS NATURAL (GN)
@@ -29,7 +29,8 @@ MESES_ABREV = {
     "Setembro": "SET", "Outubro": "OUT", "Novembro": "NOV", "Dezembro": "DEZ",
 }
 
-CLIENTE_CORES = {
+CLIENTE_CORES_BASE = {
+    "CAFE": "#D97706",
     "MILAN": "#00823B",
     "MINEIRO": "#4F4F4F",
     "GRECA": "#57B947",
@@ -37,6 +38,14 @@ CLIENTE_CORES = {
     "SAN CRISTO": "#79B829",
     "EXCELÊNCIA RAÇÕES": "#8E44AD",
 }
+
+# Paleta usada automaticamente para clientes novos.
+# Nenhum cliente precisa ser cadastrado diretamente no código.
+PALETA_CLIENTES = [
+    "#006B35", "#2EAD59", "#0E7490", "#2563EB", "#7C3AED",
+    "#BE185D", "#C2410C", "#A16207", "#4D7C0F", "#0F766E",
+    "#4338CA", "#9333EA", "#B91C1C", "#475569", "#0891B2",
+]
 
 VERDE = "#006B35"
 VERDE_CLARO = "#2EAD59"
@@ -51,22 +60,36 @@ ANO_PADRAO = 2026
 # =========================================================
 
 def parse_numero_br(valor) -> float:
-    """Converte números em padrão brasileiro, aceitando vazio, ponto de milhar e vírgula decimal."""
+    """Converte número brasileiro ou internacional para float."""
     if pd.isna(valor):
         return 0.0
+
     texto = str(valor).strip()
     if texto.lower() in {"", "-", "nan", "none", "null"}:
         return 0.0
-    texto = texto.replace("m³", "").replace("m3", "").replace("%", "").strip()
-    texto = texto.replace(" ", "")
 
-    # Padrão brasileiro: 1.234,56
-    if "," in texto:
+    texto = (
+        texto.replace("m³", "")
+        .replace("m3", "")
+        .replace("%", "")
+        .replace(" ", "")
+        .strip()
+    )
+
+    # 1.234,56 -> 1234.56
+    # 1,234.56 -> 1234.56
+    # 1234,56  -> 1234.56
+    if "," in texto and "." in texto:
+        if texto.rfind(",") > texto.rfind("."):
+            texto = texto.replace(".", "").replace(",", ".")
+        else:
+            texto = texto.replace(",", "")
+    elif "," in texto:
         texto = texto.replace(".", "").replace(",", ".")
 
     try:
         return float(texto)
-    except ValueError:
+    except (TypeError, ValueError):
         return 0.0
 
 
@@ -113,38 +136,108 @@ def logo_base64() -> str | None:
         return None
 
 
+def obter_mapa_cores(clientes) -> dict[str, str]:
+    """Mantém cores conhecidas e atribui cores automaticamente aos novos clientes."""
+    nomes = sorted({str(c).strip().upper() for c in clientes if str(c).strip()})
+    mapa = dict(CLIENTE_CORES_BASE)
+    indice = 0
+
+    for cliente in nomes:
+        if cliente not in mapa:
+            mapa[cliente] = PALETA_CLIENTES[indice % len(PALETA_CLIENTES)]
+            indice += 1
+
+    return mapa
+
+
 # =========================================================
-# CARGA DOS DADOS
+# CARGA, VALIDAÇÃO E GRAVAÇÃO DOS DADOS
 # =========================================================
 
-@st.cache_data(show_spinner=False)
-def carregar_dados_manuais() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    mensal_path = DATA_DIR / "entradas_vendas_mensais.csv"
-    diario_path = DATA_DIR / "entradas_vendas_diarias.csv"
-    config_path = DATA_DIR / "configuracoes.csv"
+MENSAL_PATH = DATA_DIR / "entradas_vendas_mensais.csv"
+DIARIO_PATH = DATA_DIR / "entradas_vendas_diarias.csv"
+CONFIG_PATH = DATA_DIR / "configuracoes.csv"
 
-    if not mensal_path.exists():
-        st.error(f"Arquivo não encontrado: {mensal_path}")
-        st.stop()
-    if not diario_path.exists():
-        st.error(f"Arquivo não encontrado: {diario_path}")
-        st.stop()
 
-    mensal_raw = pd.read_csv(mensal_path, sep=";", dtype=str, encoding="utf-8")
-    mensal_raw.columns = [str(c).strip() for c in mensal_raw.columns]
+def assinatura_arquivo(caminho: Path) -> tuple[int, int]:
+    """Assinatura simples para invalidar o cache quando o CSV for alterado."""
+    if not caminho.exists():
+        return 0, 0
+    stat = caminho.stat()
+    return stat.st_mtime_ns, stat.st_size
 
-    if "Cliente" not in mensal_raw.columns:
-        st.error("O CSV mensal precisa ter a coluna 'Cliente'.")
-        st.stop()
 
-    mensal_raw["Cliente"] = mensal_raw["Cliente"].astype(str).str.strip().str.upper()
+def ler_csv_flexivel(fonte: Path | bytes | bytearray) -> pd.DataFrame:
+    """
+    Lê CSV separado por ponto e vírgula ou vírgula.
+
+    O separador é identificado pelo cabeçalho. Isso permite manter o padrão
+    brasileiro atual (ponto e vírgula + vírgula decimal) ou migrar para o
+    padrão internacional (vírgula + ponto decimal).
+    """
+    if isinstance(fonte, Path):
+        conteudo = fonte.read_bytes()
+    else:
+        conteudo = bytes(fonte)
+
+    try:
+        texto = conteudo.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        texto = conteudo.decode("latin-1")
+
+    linhas = [linha for linha in texto.splitlines() if linha.strip()]
+    if not linhas:
+        return pd.DataFrame()
+
+    cabecalho = linhas[0]
+    separador = ";" if cabecalho.count(";") >= cabecalho.count(",") else ","
+
+    return pd.read_csv(
+        io.StringIO(texto),
+        sep=separador,
+        dtype=str,
+        keep_default_na=False,
+    )
+
+
+def normalizar_base_mensal(df: pd.DataFrame) -> pd.DataFrame:
+    """Valida e padroniza a matriz Cliente x meses."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Cliente", *MESES])
+
+    base = df.copy()
+    base.columns = [str(c).strip() for c in base.columns]
+
+    coluna_cliente = next(
+        (c for c in base.columns if c.strip().lower() == "cliente"),
+        None,
+    )
+    if coluna_cliente is None:
+        raise ValueError("O CSV mensal precisa ter a coluna 'Cliente'.")
+    if coluna_cliente != "Cliente":
+        base = base.rename(columns={coluna_cliente: "Cliente"})
 
     for mes in MESES:
-        if mes not in mensal_raw.columns:
-            mensal_raw[mes] = ""
-        mensal_raw[mes] = mensal_raw[mes].apply(parse_numero_br)
+        if mes not in base.columns:
+            base[mes] = 0.0
 
-    mensal = mensal_raw.melt(
+    base = base[["Cliente", *MESES]].copy()
+    base["Cliente"] = base["Cliente"].astype(str).str.strip().str.upper()
+    base = base[base["Cliente"] != ""].copy()
+
+    for mes in MESES:
+        base[mes] = base[mes].apply(parse_numero_br).clip(lower=0)
+
+    duplicados = base.loc[base["Cliente"].duplicated(keep=False), "Cliente"].unique()
+    if len(duplicados):
+        nomes = ", ".join(sorted(duplicados))
+        raise ValueError(f"Há clientes duplicados no CSV: {nomes}.")
+
+    return base.reset_index(drop=True)
+
+
+def base_mensal_para_longo(base: pd.DataFrame) -> pd.DataFrame:
+    mensal = base.melt(
         id_vars="Cliente",
         value_vars=MESES,
         var_name="Mês",
@@ -152,38 +245,95 @@ def carregar_dados_manuais() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     )
     mensal["Mês_Ordem"] = mensal["Mês"].map({mes: i + 1 for i, mes in enumerate(MESES)})
     mensal["Mês_Abrev"] = mensal["Mês"].map(MESES_ABREV)
-    mensal = mensal[mensal["Volume_m3"] > 0].copy()
+    return mensal[mensal["Volume_m3"] > 0].copy()
 
-    diario_raw = pd.read_csv(diario_path, sep=";", dtype=str, encoding="utf-8")
+
+def serializar_base_mensal(base: pd.DataFrame) -> bytes:
+    """Gera o CSV mensal no padrão brasileiro usado pelo projeto."""
+    exportar = normalizar_base_mensal(base)
+    for mes in MESES:
+        exportar[mes] = exportar[mes].map(
+            lambda valor: "" if float(valor) == 0 else fmt_numero_br(valor)
+        )
+    texto = exportar.to_csv(index=False, sep=";", lineterminator="\n")
+    return texto.encode("utf-8-sig")
+
+
+def salvar_base_mensal(base: pd.DataFrame) -> tuple[bool, str]:
+    """Salva localmente o CSV mensal de forma atômica."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        conteudo = serializar_base_mensal(base)
+        temporario = MENSAL_PATH.with_suffix(".csv.tmp")
+        temporario.write_bytes(conteudo)
+        temporario.replace(MENSAL_PATH)
+        st.cache_data.clear()
+        return True, "Arquivo mensal atualizado com sucesso."
+    except PermissionError:
+        return False, (
+            "O ambiente não permitiu gravar no arquivo. Baixe o CSV atualizado "
+            "e substitua o arquivo na pasta data do GitHub."
+        )
+    except Exception as exc:
+        return False, f"Não foi possível salvar o CSV: {exc}"
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def carregar_dados_manuais(
+    assinatura_mensal: tuple[int, int],
+    assinatura_diario: tuple[int, int],
+    assinatura_config: tuple[int, int],
+) -> tuple[pd.DataFrame, pd.DataFrame, dict, pd.DataFrame]:
+    # As assinaturas fazem parte da chave do cache.
+    _ = (assinatura_mensal, assinatura_diario, assinatura_config)
+
+    if not MENSAL_PATH.exists():
+        raise FileNotFoundError(f"Arquivo não encontrado: {MENSAL_PATH}")
+    if not DIARIO_PATH.exists():
+        raise FileNotFoundError(f"Arquivo não encontrado: {DIARIO_PATH}")
+
+    mensal_base = normalizar_base_mensal(ler_csv_flexivel(MENSAL_PATH))
+    mensal = base_mensal_para_longo(mensal_base)
+
+    diario_raw = ler_csv_flexivel(DIARIO_PATH)
     diario_raw.columns = [str(c).strip() for c in diario_raw.columns]
 
     if "Data" not in diario_raw.columns or "Volume_m3" not in diario_raw.columns:
-        st.error("O CSV diário precisa ter as colunas 'Data' e 'Volume_m3'.")
-        st.stop()
+        raise ValueError("O CSV diário precisa ter as colunas 'Data' e 'Volume_m3'.")
 
     diario_raw["Data"] = pd.to_datetime(diario_raw["Data"], dayfirst=True, errors="coerce")
     diario_raw["Volume_m3"] = diario_raw["Volume_m3"].apply(parse_numero_br)
     diario = diario_raw.dropna(subset=["Data"]).sort_values("Data").copy()
 
     config = {}
-    if config_path.exists():
-        config_raw = pd.read_csv(config_path, sep=";", dtype=str, encoding="utf-8")
+    if CONFIG_PATH.exists():
+        config_raw = ler_csv_flexivel(CONFIG_PATH)
         config_raw.columns = [str(c).strip() for c in config_raw.columns]
         if {"Parametro", "Valor"}.issubset(config_raw.columns):
             config = dict(zip(config_raw["Parametro"], config_raw["Valor"]))
 
-    return mensal, diario, config
+    return mensal, diario, config, mensal_base
 
 
 def carregar_dados_api_scada() -> tuple[pd.DataFrame, pd.DataFrame, dict] | None:
-    """
-    Ponto preparado para integração futura com SCADA/API/software interno.
-
-    Quando a API estiver definida, substitua este return None pela chamada real.
-    O retorno deve ser: mensal_df, diario_df, config_dict.
-    """
+    """Ponto preparado para integração futura com SCADA/API/software interno."""
     return None
 
+
+def carregar_dados_dashboard() -> tuple[pd.DataFrame, pd.DataFrame, dict, pd.DataFrame]:
+    """Centraliza a carga e apresenta mensagens de erro amigáveis."""
+    try:
+        return carregar_dados_manuais(
+            assinatura_arquivo(MENSAL_PATH),
+            assinatura_arquivo(DIARIO_PATH),
+            assinatura_arquivo(CONFIG_PATH),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        st.error(str(exc))
+        st.stop()
+    except Exception as exc:
+        st.error(f"Erro ao carregar os dados: {exc}")
+        st.stop()
 
 # =========================================================
 # PERÍODOS DINÂMICOS
@@ -521,7 +671,7 @@ def criar_fig_linha(df_mensal_total: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def criar_fig_barras(mensal: pd.DataFrame) -> go.Figure:
+def criar_fig_barras(mensal: pd.DataFrame, cores_clientes: dict[str, str]) -> go.Figure:
     fig = go.Figure()
     for cliente in sorted(mensal["Cliente"].unique()):
         dados = mensal[mensal["Cliente"] == cliente].sort_values("Mês_Ordem")
@@ -530,7 +680,7 @@ def criar_fig_barras(mensal: pd.DataFrame) -> go.Figure:
                 x=dados["Mês"],
                 y=dados["Volume_m3"],
                 name=cliente,
-                marker_color=CLIENTE_CORES.get(cliente, VERDE_CLARO),
+                marker_color=cores_clientes.get(cliente, VERDE_CLARO),
                 text=[fmt_numero_br(v) for v in dados["Volume_m3"]],
                 textposition="outside",
                 hovertemplate=f"{cliente}<br>%{{x}}<br>%{{y:,.2f}} m³<extra></extra>",
@@ -550,13 +700,13 @@ def criar_fig_barras(mensal: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def criar_fig_donut(ranking: pd.DataFrame, total: float) -> go.Figure:
+def criar_fig_donut(ranking: pd.DataFrame, total: float, cores_clientes: dict[str, str]) -> go.Figure:
     fig = go.Figure(
         go.Pie(
             labels=ranking["Cliente"],
             values=ranking["Volume_m3"],
             hole=0.55,
-            marker=dict(colors=[CLIENTE_CORES.get(c, VERDE_CLARO) for c in ranking["Cliente"]]),
+            marker=dict(colors=[cores_clientes.get(c, VERDE_CLARO) for c in ranking["Cliente"]]),
             textinfo="percent",
             textfont=dict(color="white", size=12),
             hovertemplate="%{label}<br>%{value:,.2f} m³<br>%{percent}<extra></extra>",
@@ -694,6 +844,187 @@ def calcular_totais(mensal: pd.DataFrame, mes_atual: str | None, mes_anterior: s
 
 
 # =========================================================
+# GERENCIAMENTO DE CLIENTES E VOLUMES
+# =========================================================
+
+
+def exibir_gerenciador_clientes(mensal_base: pd.DataFrame) -> None:
+    """
+    Permite incluir clientes, editar volumes e importar/exportar o CSV.
+
+    No Streamlit Community Cloud, gravações feitas pelo navegador podem ser
+    perdidas quando o aplicativo reiniciar. Para persistência definitiva,
+    deve-se baixar o CSV e substituir data/entradas_vendas_mensais.csv no GitHub.
+    """
+    mensagem = st.session_state.pop("mensagem_gerenciador", None)
+    if mensagem:
+        tipo, texto = mensagem
+        getattr(st, tipo)(texto)
+
+    with st.expander("⚙ Gerenciar clientes e volumes", expanded=False):
+        st.caption(
+            "Clientes novos também podem ser incluídos diretamente no arquivo "
+            "data/entradas_vendas_mensais.csv. Basta adicionar uma nova linha; "
+            "o dashboard criará ranking, gráficos e cor automaticamente."
+        )
+        st.warning(
+            "No Streamlit Community Cloud, alterações salvas pelo botão podem ser "
+            "temporárias. Para torná-las permanentes, baixe o CSV atualizado e "
+            "substitua o arquivo correspondente no repositório GitHub."
+        )
+
+        aba_adicionar, aba_editar, aba_importar = st.tabs(
+            ["Adicionar cliente", "Editar tabela", "Importar ou baixar CSV"]
+        )
+
+        with aba_adicionar:
+            with st.form("form_adicionar_cliente", clear_on_submit=True):
+                c1, c2, c3 = st.columns([1.6, 1, 1])
+                with c1:
+                    nome = st.text_input("Nome do cliente")
+                with c2:
+                    mes_inicial = st.selectbox("Mês inicial", MESES, index=0)
+                with c3:
+                    volume_inicial = st.number_input(
+                        "Volume inicial (m³)",
+                        min_value=0.0,
+                        value=0.0,
+                        step=100.0,
+                        format="%.2f",
+                    )
+
+                adicionar = st.form_submit_button("Adicionar cliente", use_container_width=True)
+
+            if adicionar:
+                nome_normalizado = nome.strip().upper()
+                if not nome_normalizado:
+                    st.error("Informe o nome do cliente.")
+                elif nome_normalizado in set(mensal_base["Cliente"]):
+                    st.error("Este cliente já está cadastrado.")
+                else:
+                    novo = {"Cliente": nome_normalizado, **{mes: 0.0 for mes in MESES}}
+                    novo[mes_inicial] = float(volume_inicial)
+                    atualizado = pd.concat(
+                        [mensal_base, pd.DataFrame([novo])],
+                        ignore_index=True,
+                    )
+                    sucesso, mensagem_salvar = salvar_base_mensal(atualizado)
+                    if sucesso:
+                        st.session_state["mensagem_gerenciador"] = (
+                            "success",
+                            f"Cliente {nome_normalizado} adicionado. {mensagem_salvar}",
+                        )
+                        st.rerun()
+                    else:
+                        st.error(mensagem_salvar)
+                        st.download_button(
+                            "Baixar CSV atualizado",
+                            data=serializar_base_mensal(atualizado),
+                            file_name="entradas_vendas_mensais.csv",
+                            mime="text/csv",
+                        )
+
+        with aba_editar:
+            st.caption(
+                "Edite os valores, adicione linhas ou exclua clientes. Valores vazios "
+                "são tratados como zero."
+            )
+            editado = st.data_editor(
+                mensal_base,
+                key="editor_mensal_clientes",
+                hide_index=True,
+                use_container_width=True,
+                num_rows="dynamic",
+                height=390,
+                column_config={
+                    "Cliente": st.column_config.TextColumn("Cliente", required=True),
+                    **{
+                        mes: st.column_config.NumberColumn(
+                            mes, min_value=0.0, step=100.0, format="%.2f"
+                        )
+                        for mes in MESES
+                    },
+                },
+            )
+
+            b1, b2 = st.columns([1, 1])
+            with b1:
+                if st.button("Salvar tabela", use_container_width=True):
+                    try:
+                        base_validada = normalizar_base_mensal(editado)
+                        sucesso, mensagem_salvar = salvar_base_mensal(base_validada)
+                        if sucesso:
+                            st.session_state["mensagem_gerenciador"] = (
+                                "success", mensagem_salvar
+                            )
+                            st.rerun()
+                        else:
+                            st.error(mensagem_salvar)
+                    except ValueError as exc:
+                        st.error(str(exc))
+            with b2:
+                try:
+                    dados_download = serializar_base_mensal(editado)
+                except ValueError:
+                    dados_download = serializar_base_mensal(mensal_base)
+                st.download_button(
+                    "Baixar tabela editada",
+                    data=dados_download,
+                    file_name="entradas_vendas_mensais.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+        with aba_importar:
+            arquivo = st.file_uploader(
+                "Selecione um novo entradas_vendas_mensais.csv",
+                type=["csv"],
+                key="upload_mensal",
+            )
+
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                if arquivo is not None and st.button(
+                    "Validar e substituir CSV", use_container_width=True
+                ):
+                    try:
+                        importado = normalizar_base_mensal(
+                            ler_csv_flexivel(arquivo.getvalue())
+                        )
+                        sucesso, mensagem_salvar = salvar_base_mensal(importado)
+                        if sucesso:
+                            st.session_state["mensagem_gerenciador"] = (
+                                "success", mensagem_salvar
+                            )
+                            st.rerun()
+                        else:
+                            st.error(mensagem_salvar)
+                            st.download_button(
+                                "Baixar CSV validado",
+                                data=serializar_base_mensal(importado),
+                                file_name="entradas_vendas_mensais.csv",
+                                mime="text/csv",
+                            )
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    except Exception as exc:
+                        st.error(f"Não foi possível importar o CSV: {exc}")
+
+            with c2:
+                st.download_button(
+                    "Baixar CSV atual",
+                    data=serializar_base_mensal(mensal_base),
+                    file_name="entradas_vendas_mensais.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+            if st.button("Recarregar dados do disco", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
+
+
+# =========================================================
 # APP PRINCIPAL
 # =========================================================
 
@@ -703,11 +1034,15 @@ def main() -> None:
 
     dados_api = carregar_dados_api_scada()
     if dados_api is None:
-        mensal, diario, config = carregar_dados_manuais()
+        mensal, diario, config, mensal_base = carregar_dados_dashboard()
     else:
         mensal, diario, config = dados_api
+        mensal_base = pd.DataFrame(columns=["Cliente", *MESES])
 
     mes_atual, mes_anterior, ano = obter_periodos_referencia(mensal)
+    cores_clientes = obter_mapa_cores(
+        mensal_base["Cliente"] if not mensal_base.empty else mensal["Cliente"].unique()
+    )
     periodo_acum = periodo_acumulado_label(mes_atual, ano)
 
     ranking, comp, tabela_anual = montar_tabelas(mensal, mes_atual, mes_anterior)
@@ -795,14 +1130,14 @@ def main() -> None:
         st.plotly_chart(criar_fig_linha(mensal_total), use_container_width=True, config={"displayModeBar": False})
 
         titulo_secao("Vendas por cliente – Evolução mensal (m³)")
-        st.plotly_chart(criar_fig_barras(mensal), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(criar_fig_barras(mensal, cores_clientes), use_container_width=True, config={"displayModeBar": False})
 
         titulo_secao(f"Acumulado anual (m³) – {ano}")
         st.dataframe(formatar_tabela_anual(tabela_anual), hide_index=True, use_container_width=True, height=220)
 
     with col_dir:
         titulo_secao("Participação no total acumulado")
-        st.plotly_chart(criar_fig_donut(ranking, total_acumulado), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(criar_fig_donut(ranking, total_acumulado, cores_clientes), use_container_width=True, config={"displayModeBar": False})
 
         titulo_secao("Evolução diária – últimos 30 dias (m³)")
         st.plotly_chart(criar_fig_diaria(diario), use_container_width=True, config={"displayModeBar": False})
@@ -813,9 +1148,11 @@ def main() -> None:
     with f2:
         st.markdown(f'<div class="footer-card"><div class="footer-title">▦ Fonte dos dados</div><div class="footer-text">{config.get("Fonte dos dados", "Sistema Comercial MTGÁS")}</div></div>', unsafe_allow_html=True)
     with f3:
-        st.markdown('<div class="footer-card"><div class="footer-title">💡 Dica</div><div class="footer-text">Atualize os arquivos CSV na pasta <b>data</b>. O mês atual e o mês anterior serão identificados automaticamente.</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="footer-card"><div class="footer-title">💡 Dica</div><div class="footer-text">Inclua clientes pelo gerenciador abaixo ou adicione uma nova linha ao CSV mensal. O dashboard se ajusta automaticamente.</div></div>', unsafe_allow_html=True)
     with f4:
         st.markdown('<div class="footer-card"><div class="footer-title">↻ Integração futura</div><div class="footer-text">Preparado para SCADA, API ou software interno.</div></div>', unsafe_allow_html=True)
+
+    exibir_gerenciador_clientes(mensal_base)
 
 
 if __name__ == "__main__":
